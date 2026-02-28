@@ -590,3 +590,551 @@ $ echo "source ~/.llama-completion.bash" >> ~/.bashrc
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
 - [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
 - [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+
+
+# Self-Speculative Decoding for DeepSeek MoE Models in llama.cpp
+
+## Abstract
+
+We implement self-speculative decoding for Mixture-of-Experts (MoE) language models within llama.cpp, exploiting the architectural separation between shared and routed experts in the DeepSeek model family. In standard speculative decoding, a smaller draft model proposes candidate tokens verified by the full model. Self-speculative decoding eliminates the need for a separate draft model by using a degraded version of the same model: specifically, we execute only the shared expert FFN while skipping routed experts during the draft phase, then verify with the full MoE computation. We describe the implementation, which modifies the llama.cpp graph construction layer to conditionally bypass routed expert computation, expose a public C API (`llama_set_moe_draft_mode`), and provide a standalone benchmark harness. Preliminary results on DeepSeek-Coder-V2-Lite (15.7B, IQ3_XXS) running on an NVIDIA RTX 5050 Laptop GPU (8 GB, Blackwell sm_120) show 35.4% draft acceptance rate at draft length 2, with effective throughput of 22.2 t/s against a 59.2 t/s baseline. Analysis reveals that V2-Lite's unusually large shared-to-routed parameter ratio (~2.6:1 per layer) renders the technique counterproductive on this model: the draft path performs 72% of full inference compute while producing low-quality predictions. We argue the technique is architecturally better suited to DeepSeek-V3/R1 (671B), where 8 of 256 routed experts dominate per-layer FLOPS and the shared expert is proportionally small.
+
+## 1. Background
+
+### 1.1 Speculative Decoding
+
+Speculative decoding (Leviathan et al., 2023; Chen et al., 2023) accelerates autoregressive inference by using a fast draft model to propose *n* candidate tokens, then verifying the entire sequence in a single forward pass of the target model. Accepted tokens are kept; the first rejected token is replaced with the target model's prediction. The technique yields speedups proportional to the draft acceptance rate and the speed ratio between draft and target models.
+
+### 1.2 Self-Speculative Decoding
+
+Self-speculative decoding (Zhang et al., 2024, "Draft & Verify") eliminates the separate draft model by degrading the target model itself. Common approaches include skipping intermediate layers or, in MoE architectures, reducing the expert computation. The key advantage is zero additional memory overhead — no second model needs to be loaded.
+
+### 1.3 DeepSeek MoE Architecture
+
+DeepSeek's MoE models (V2, V2-Lite, V3, R1) compute each transformer layer's FFN output as:
+
+```
+FFN_out = SharedExpert(x) + RoutedExperts(x)
+```
+
+where `SharedExpert` is a standard dense FFN applied to every token, and `RoutedExperts` selects `k` of `N` expert FFNs via a learned gating function. The shared expert provides a "baseline" representation; routed experts add token-specific specialization.
+
+| Model | Params | Experts (N) | Active (k) | Shared | Shared FFN dim | Expert FFN dim |
+|-------|--------|-------------|------------|--------|----------------|----------------|
+| V2-Lite | 15.7B | 64 | 6 | 2 | 10944 | 1408 |
+| V2 | 236B | 160 | 6 | 2 | — | — |
+| V3 / R1 | 671B | 256 | 8 | 1 | 2048 | 2048 |
+
+The critical architectural observation: in V2-Lite, each shared expert FFN is large (dim 10944) relative to each routed expert (dim 1408). Two shared experts process every token, totaling ~134M multiply-accumulate operations per layer, versus ~52M for the 6 active routed experts. The shared path already dominates compute.
+
+In V3/R1, this ratio inverts: routed experts collectively dominate per-layer FLOPS, making the shared-expert-only draft path significantly cheaper than full inference.
+
+## 2. Implementation
+
+### 2.1 Overview
+
+The implementation modifies 7 files in llama.cpp (based on commit `d91ca639`), adding approximately 60 lines of code across the graph construction layer, context management, and public API.
+
+### 2.2 API
+
+```c
+// include/llama.h
+LLAMA_API void llama_set_moe_draft_mode(struct llama_context * ctx, int32_t n_expert);
+```
+
+Where `n_expert`:
+- `-1` = normal mode (use all configured experts)
+- `0` = skip all routed experts (shared expert only)  
+- `1+` = use top-N routed experts (reduced MoE) — *currently limited by ggml tensor allocation; see Section 4*
+
+### 2.3 Flag Propagation Chain
+
+```
+llama_set_moe_draft_mode(ctx, 0)              // Public C API
+  → ctx->set_moe_draft_mode(0)                // llama_context method
+    → moe_draft_n_expert = 0                  // llama_context member
+      → graph_params(): moe_draft_n_expert    // Propagated to graph params
+        → llm_graph_context::moe_draft_n_expert   // Available during graph build
+          → if (moe_draft_n_expert != 0) {    // deepseek2.cpp / deepseek.cpp
+                build_moe_ffn(...)            //   Full or reduced MoE
+             } else {
+                cur = ffn_shexp;              //   Shared expert only
+             }
+```
+
+### 2.4 Graph Layer Surgery (deepseek2.cpp)
+
+The core modification reorders the MoE computation to always compute the shared expert first, then conditionally add routed experts:
+
+```cpp
+// FFN shared expert (always computed)
+ggml_tensor * ffn_shexp = build_ffn(cur, ...shared weights...);
+
+if (moe_draft_n_expert != 0) {
+    // Full or reduced MoE
+    const int64_t n_expert_act = (moe_draft_n_expert > 0)
+        ? (int64_t) moe_draft_n_expert : n_expert_used;
+    ggml_tensor * moe_out = build_moe_ffn(cur, ..., n_expert, n_expert_act, ...);
+    cur = ggml_add(ctx0, moe_out, ffn_shexp);
+} else {
+    // Draft mode: shared expert only
+    cur = ffn_shexp;
+}
+```
+
+### 2.5 Graph Reuse Safety
+
+The `allow_reuse()` function in `llm_graph_params` includes `moe_draft_n_expert` in its topology comparison, ensuring the computation graph is rebuilt when switching between draft and verify modes:
+
+```cpp
+bool allow_reuse(const llm_graph_params & other) const {
+    // ... existing checks ...
+    return
+        cparams.embeddings  == other.cparams.embeddings  &&
+        cparams.causal_attn == other.cparams.causal_attn &&
+        moe_draft_n_expert  == other.moe_draft_n_expert  &&  // NEW
+        arch  == other.arch  && ...
+}
+```
+
+### 2.6 Self-Speculative Loop
+
+The benchmark harness (`moe-self-spec-test.cpp`) implements the standard speculative decoding loop:
+
+1. **Draft phase**: Set `llama_set_moe_draft_mode(ctx, 0)`, generate `n_draft` tokens autoregressively using shared expert only
+2. **KV rollback**: Remove draft-phase KV entries via `llama_memory_seq_rm()`
+3. **Verify phase**: Set `llama_set_moe_draft_mode(ctx, -1)`, evaluate all draft tokens in a single batch with full MoE
+4. **Accept/reject**: Greedily compare draft predictions against verify predictions; accept matching prefix, replace first mismatch with verify token
+5. **KV trim**: Remove KV entries beyond accepted tokens
+
+## 3. Preliminary Results
+
+### 3.1 Hardware
+
+- **GPU**: NVIDIA GeForce RTX 5050 Laptop GPU (8 GB GDDR7, Blackwell sm_120)
+- **CUDA**: 12.8.61
+- **Build**: llama.cpp b8184, native sm_120 compilation
+
+### 3.2 Model
+
+- **DeepSeek-Coder-V2-Lite-Instruct** (15.7B total, ~2.4B active)
+- **Quantization**: IQ3_XXS (6.96 GB on disk, 3.06 bpw)
+- **Context**: 512 tokens, full GPU offload (28/28 layers)
+
+### 3.3 Benchmark: "Write a short story about a robot" (64 tokens)
+
+| Configuration | Tokens | Acceptance | Draft t/s | Effective t/s | Time (ms) |
+|---------------|--------|------------|-----------|---------------|-----------|
+| Baseline (no speculation) | 64 | — | — | **59.2** | 1,081 |
+| Self-spec, d=5, e=0 | 64 | 15.6% | 106.4 | 18.6 | 3,437 |
+| Self-spec, d=2, e=0 | 64 | 35.4% | 61.6 | 22.2 | 2,884 |
+
+### 3.4 Analysis
+
+The results are a clear negative for V2-Lite. Two factors explain the failure:
+
+**Factor 1: Draft speed ≈ Baseline speed.** At d=2, draft throughput is 61.6 t/s versus 59.2 t/s baseline — a mere 4% speedup from skipping routed experts. This confirms that on V2-Lite, the shared expert FFN (dim 10944 × 2 experts) dominates per-layer compute, while the routed experts (dim 1408 × 6 active) are already cheap. Skipping the cheap part doesn't help.
+
+**Factor 2: Low acceptance rate.** At 35.4% (d=2) and 15.6% (d=5), the shared expert alone is a poor predictor of full-model behavior. The routed experts carry substantial semantic information on this model, meaning the draft deviates frequently from the verify path.
+
+The combination is fatal: negligible draft speedup × low acceptance rate × verify overhead (full re-evaluation of draft tokens) = net slowdown.
+
+**Shorter drafts help acceptance but not throughput.** Reducing draft length from 5 to 2 roughly doubles acceptance rate (15.6% → 35.4%) by reducing the probability of encountering a mismatch. However, the fundamental speed ratio problem remains.
+
+### 3.5 Theoretical Speedup Model
+
+For self-speculative decoding to yield a net speedup, the following inequality must hold:
+
+```
+(1 + α·d) / (d·t_draft + t_verify) > 1 / t_base
+```
+
+where `α` = acceptance rate, `d` = draft length, `t_draft` = time per draft token, `t_verify` = time to verify the batch, and `t_base` = time per baseline token. On V2-Lite with d=2: `t_draft ≈ t_base` (no draft speedup), making the inequality impossible to satisfy regardless of acceptance rate. The technique requires `t_draft << t_base`, which only holds when routed experts dominate compute.
+
+## 4. Limitations and Known Issues
+
+### 4.1 Top-N Expert Mode (n_expert > 0)
+
+The `-e N` parameter for using top-N routed experts (instead of skipping all) is implemented in the graph builder but currently crashes at runtime. The ggml tensor allocator pre-allocates view buffers sized for the full expert count during graph reservation. When `build_moe_ffn` is called with a reduced `n_expert_used`, the resulting tensor views violate size assertions:
+
+```
+GGML_ASSERT(view_src == NULL || data_size == 0 || 
+            data_size + view_offs <= ggml_nbytes(view_src)) failed
+```
+
+Fixing this requires either: (a) reserving buffers for the maximum expert count regardless of draft mode, which requires ggml-level changes to decouple reservation sizing from graph construction; or (b) using two separate contexts with different reservations for draft and verify modes.
+
+### 4.2 Scheduler Overhead
+
+Each transition between draft and verify mode invalidates the cached computation graph (via `allow_reuse()` topology mismatch), forcing a graph rebuild. On GPUs with CUDA graph support, this also invalidates the CUDA graph, triggering a warmup pass. For the n_expert=0 mode, the overhead is manageable since graph topology changes only in the presence/absence of MoE subgraphs. Future optimization could maintain two pre-built graphs and switch between them.
+
+### 4.3 KV Cache Contamination
+
+Draft-phase KV entries are computed with shared-expert-only representations, which differ from full-MoE representations. The current implementation rolls back all draft KV entries before verification (`llama_memory_seq_rm`), then recomputes them with full MoE. An alternative approach — keeping draft KV entries and only recomputing mismatched positions — would be incorrect because even "accepted" tokens have subtly different internal representations when routed experts are included.
+
+## 5. Future Work
+
+### 5.1 DeepSeek-V3 / R1 Evaluation (Primary)
+
+The technique is architecturally better suited to DeepSeek-V3 (671B) where routed experts dominate per-layer compute. With 256 experts and 8 active per token, each with FFN dim 2048, the routed computation is ~8× the shared expert cost. Skipping routed experts would reduce draft compute to ~11% of full inference — a much more favorable speed ratio than V2-Lite's ~72%.
+
+**Planned hardware**: 8× NVIDIA V100 (32 GB each, full NVLink), 256 GB total VRAM. Target model: DeepSeek-V3-0324 at IQ2_XS quantization (~180–200 GB).
+
+### 5.2 Layer-Selective MoE Skipping
+
+Instead of skipping routed experts in all layers, skip them only in middle layers (which empirically contribute less to output quality) while retaining full MoE in the first and last N layers. This approach: (a) preserves graph topology per-layer (no ggml allocation issues), (b) produces better draft quality by retaining experts where they matter most, and (c) is configurable per deployment.
+
+### 5.3 Adaptive Draft Length
+
+Dynamically adjust `n_draft` based on running acceptance rate. High acceptance → increase draft length to amortize verify cost over more tokens. Low acceptance → reduce draft length to minimize wasted computation.
+
+### 5.4 Top-K Expert Draft Mode
+
+Fix the ggml tensor allocation issue to enable top-1 or top-2 expert draft mode. Using the single highest-weighted expert (instead of all 6–8) preserves ~83–87% of compute savings while producing substantially better draft predictions than shared-expert-only mode.
+
+### 5.5 Acceptance Rate vs. Quantization
+
+Measure acceptance rate across quantization levels (IQ2, IQ3, Q4, Q6, Q8, F16) for the same model. Hypothesis: heavier quantization adds noise to routed expert contributions, effectively reducing the signal that distinguishes full-MoE from shared-only, thereby *increasing* acceptance rate. If confirmed, this would mean self-speculative decoding becomes more effective at lower quantization — a useful result for consumer hardware.
+
+## 6. Build and Usage
+
+### 6.1 Requirements
+
+- llama.cpp (commit d91ca639 or later from this fork)
+- CUDA Toolkit 12.8+ (for Blackwell sm_120) or 11.0+ (for V100 sm_70)
+- CMake 3.21+
+- C++17 compiler
+
+### 6.2 Build
+
+```bash
+# Clone this fork
+git clone https://github.com/<username>/llama.cpp.git
+cd llama.cpp
+
+# Configure (adjust -DCMAKE_CUDA_ARCHITECTURES for your GPU)
+# sm_120 = RTX 5050/5060/5070/5080/5090 (Blackwell)
+# sm_70  = V100
+# sm_89  = RTX 4090
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120
+
+# Build everything
+cmake --build build --config Release
+
+# Or build just the benchmark
+cmake --build build --config Release --target moe-self-spec-test
+```
+
+### 6.3 Run Benchmark
+
+```bash
+# Shared expert only (e=0), draft length 2, with baseline comparison
+moe-self-spec-test -m model.gguf -c 512 -ngl 999 -n 128 -d 2 -e 0 --baseline
+
+# Options:
+#   -m   model path (required)
+#   -p   prompt (default: "Write a short story about a robot.")
+#   -n   tokens to generate (default: 128)
+#   -d   draft tokens per step (default: 5)
+#   -e   draft expert count: 0=shared only (default: 0)
+#   -c   context size (default: 512)
+#   -ngl GPU layers to offload (default: 999)
+#   --baseline  also run standard autoregressive for comparison
+```
+
+### 6.4 Use the API
+
+```c
+#include "llama.h"
+
+// During speculative loop:
+
+// Draft phase — shared expert only
+llama_set_moe_draft_mode(ctx, 0);
+// ... generate draft tokens ...
+
+// Verify phase — full MoE
+llama_set_moe_draft_mode(ctx, -1);
+// ... verify batch ...
+```
+
+## 7. Files Modified
+
+| File | Changes |
+|------|---------|
+| `include/llama.h` | `llama_set_moe_draft_mode()` declaration |
+| `src/llama-graph.h` | `moe_draft_n_expert` in params struct and graph context; `allow_reuse()` topology check |
+| `src/llama-graph.cpp` | Constructor initialization of `moe_draft_n_expert` |
+| `src/llama-context.h` | `set_moe_draft_mode()` method; `moe_draft_n_expert` member |
+| `src/llama-context.cpp` | Method implementation; `graph_params()` propagation; C API wrapper |
+| `src/models/deepseek2.cpp` | Conditional MoE bypass in DeepSeek V2/V2-Lite/V3/R1 graph builder |
+| `src/models/deepseek.cpp` | Same for DeepSeek V1 |
+| `examples/moe-self-spec-test/` | Standalone benchmark harness |
+
+## References
+
+- Chen, C., et al. (2023). "Accelerating Large Language Model Decoding with Speculative Sampling." arXiv:2302.01318.
+- Leviathan, Y., et al. (2023). "Fast Inference from Transformers via Speculative Decoding." ICML 2023.
+- Zhang, J., et al. (2024). "Draft & Verify: Lossless Large Language Model Acceleration via Self-Speculative Decoding." ACL 2024.
+- DeepSeek-AI. (2024). "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model." arXiv:2405.04434.
+- DeepSeek-AI. (2025). "DeepSeek-V3 Technical Report." arXiv:2412.19437.
+
+## License
+
+This implementation is a patch against llama.cpp and is released under the same license (MIT).
+
+```
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -963,6 +963,12 @@
+     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
+     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+ 
++    // Set MoE draft mode for self-speculative decoding.
++    //   n_expert = -1: normal mode (use all configured experts)
++    //   n_expert =  0: skip all routed experts (shared expert only)
++    //   n_expert = 1+: use top-N routed experts (reduced MoE)
++    LLAMA_API void llama_set_moe_draft_mode(struct llama_context * ctx, int32_t n_expert);
++
+     // Set abort callback
+     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+ 
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -553,6 +553,12 @@
+ 
+     uint32_t n_outputs;
+ 
++    // self-speculative decoding: override n_expert_used in MoE layers
++    //   -1 = normal mode (use hparams.n_expert_used)
++    //    0 = skip all routed experts (shared expert only)
++    //   1+ = use top-N routed experts (draft with reduced expert count)
++    int32_t moe_draft_n_expert = -1;
++
+     llm_graph_cb cb;
+ 
+     llm_graph_result * res;
+@@ -615,6 +621,7 @@
+         return
+             cparams.embeddings  == other.cparams.embeddings  &&
+             cparams.causal_attn == other.cparams.causal_attn &&
++            moe_draft_n_expert  == other.moe_draft_n_expert  &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
+@@ -717,6 +724,9 @@
+     const int64_t n_expert;
+     const int64_t n_expert_used;
+ 
++    // self-speculative decoding: override for n_expert_used in draft mode
++    const int32_t moe_draft_n_expert;
++
+     const float freq_base;
+     const float freq_scale;
+     const float ext_factor;
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -829,6 +829,7 @@
+     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
+     n_expert         (hparams.n_expert),
+     n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
++    moe_draft_n_expert(params.moe_draft_n_expert),
+     freq_base        (cparams.rope_freq_base),
+     freq_scale       (cparams.rope_freq_scale),
+     ext_factor       (cparams.yarn_ext_factor),
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -105,6 +105,10 @@
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
++    // self-speculative decoding: set MoE draft expert count
++    //   -1 = normal mode, 0 = shared expert only, 1+ = top-N routed experts
++    void set_moe_draft_mode(int32_t n_expert);
++
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+ 
+     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+@@ -343,6 +347,9 @@
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
++    // self-speculative decoding: MoE draft expert count (-1 = normal)
++    int32_t moe_draft_n_expert = -1;
++
+     // perf
+     mutable int64_t t_start_us  = 0;
+     mutable int64_t t_load_us   = 0;
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1013,6 +1013,19 @@
+     //sched_need_reserve = true;
+ }
+ 
++void llama_context::set_moe_draft_mode(int32_t n_expert) {
++    LLAMA_LOG_DEBUG("%s: n_expert = %d\n", __func__, n_expert);
++
++    if (moe_draft_n_expert == n_expert) {
++        return;
++    }
++
++    moe_draft_n_expert = n_expert;
++
++    // changing expert count changes graph topology — force scheduler re-reserve
++    sched_need_reserve = true;
++}
++
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+@@ -2107,6 +2120,7 @@
+         /*.cross       =*/ &cross,
+         /*.samplers    =*/ sampling.samplers,
+         /*.n_outputs   =*/ n_outputs,
++        /*.moe_draft_n_expert =*/ moe_draft_n_expert,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
+     };
+@@ -3128,6 +3142,10 @@
+     ctx->set_warmup(warmup);
+ }
+ 
++void llama_set_moe_draft_mode(llama_context * ctx, int32_t n_expert) {
++    ctx->set_moe_draft_mode(n_expert);
++}
++
+ void llama_synchronize(llama_context * ctx) {
+     ctx->synchronize();
+ }
+--- a/src/models/deepseek2.cpp
++++ b/src/models/deepseek2.cpp
+@@ -207,34 +207,41 @@
+                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+             cb(cur, "ffn_out", il);
+         } else {
+-            // MoE branch
+-            ggml_tensor * moe_out = build_moe_ffn(cur,
+-                model.layers[il].ffn_gate_inp,
+-                model.layers[il].ffn_up_exps,
+-                model.layers[il].ffn_gate_exps,
+-                model.layers[il].ffn_down_exps,
+-                model.layers[il].ffn_exp_probs_b,
+-                n_expert, n_expert_used,
+-                LLM_FFN_SILU, hparams.expert_weights_norm,
+-                hparams.expert_weights_scale, hparams.expert_weights_scale,
+-                (llama_expert_gating_func_type) hparams.expert_gating_func,
+-                il,
+-                nullptr,
+-                model.layers[il].ffn_gate_up_exps);
+-            cb(moe_out, "ffn_moe_out", il);
++            // FFN shared expert (always computed, even in draft mode)
++            ggml_tensor * ffn_shexp =
++                build_ffn(cur,
++                    model.layers[il].ffn_up_shexp, NULL, NULL,
++                    model.layers[il].ffn_gate_shexp, NULL, NULL,
++                    model.layers[il].ffn_down_shexp, NULL, NULL,
++                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(ffn_shexp, "ffn_shexp", il);
+ 
+-            // FFN shared expert
+-            {
+-                ggml_tensor * ffn_shexp =
+-                    build_ffn(cur,
+-                        model.layers[il].ffn_up_shexp, NULL, NULL,
+-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
+-                        model.layers[il].ffn_down_shexp, NULL, NULL,
+-                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-                cb(ffn_shexp, "ffn_shexp", il);
++            if (moe_draft_n_expert != 0) {
++                // MoE branch: use full experts (normal) or reduced count (draft)
++                const int64_t n_expert_act = (moe_draft_n_expert > 0)
++                    ? (int64_t) moe_draft_n_expert : n_expert_used;
++
++                ggml_tensor * moe_out = build_moe_ffn(cur,
++                    model.layers[il].ffn_gate_inp,
++                    model.layers[il].ffn_up_exps,
++                    model.layers[il].ffn_gate_exps,
++                    model.layers[il].ffn_down_exps,
++                    model.layers[il].ffn_exp_probs_b,
++                    n_expert, n_expert_act,
++                    LLM_FFN_SILU, hparams.expert_weights_norm,
++                    hparams.expert_weights_scale, hparams.expert_weights_scale,
++                    (llama_expert_gating_func_type) hparams.expert_gating_func,
++                    il,
++                    nullptr,
++                    model.layers[il].ffn_gate_up_exps);
++                cb(moe_out, "ffn_moe_out", il);
+ 
+                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                 cb(cur, "ffn_out", il);
++            } else {
++                // Self-speculative draft mode: shared expert only, skip routed experts
++                cur = ffn_shexp;
++                cb(cur, "ffn_out", il);
+             }
+         }
+         cur = ggml_add(ctx0, cur, ffn_inp);
+--- a/src/models/deepseek.cpp
++++ b/src/models/deepseek.cpp
+@@ -91,32 +91,39 @@
+                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+             cb(cur, "ffn_out", il);
+         } else {
+-            // MoE branch
+-            ggml_tensor * moe_out = build_moe_ffn(cur,
+-                model.layers[il].ffn_gate_inp,
+-                model.layers[il].ffn_up_exps,
+-                model.layers[il].ffn_gate_exps,
+-                model.layers[il].ffn_down_exps,
+-                nullptr,
+-                n_expert, n_expert_used,
+-                LLM_FFN_SILU, false,
+-                false, hparams.expert_weights_scale,
+-                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+-                il);
+-            cb(moe_out, "ffn_moe_out", il);
++            // FFN shared expert (always computed, even in draft mode)
++            ggml_tensor * ffn_shexp =
++                build_ffn(cur,
++                    model.layers[il].ffn_up_shexp, NULL, NULL,
++                    model.layers[il].ffn_gate_shexp, NULL, NULL,
++                    model.layers[il].ffn_down_shexp, NULL, NULL,
++                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(ffn_shexp, "ffn_shexp", il);
++
++            if (moe_draft_n_expert != 0) {
++                // MoE branch: use full experts (normal) or reduced count (draft)
++                const int64_t n_expert_act = (moe_draft_n_expert > 0)
++                    ? (int64_t) moe_draft_n_expert : n_expert_used;
+ 
+-            // FFN shared expert
+-            {
+-                ggml_tensor * ffn_shexp =
+-                    build_ffn(cur,
+-                        model.layers[il].ffn_up_shexp, NULL, NULL,
+-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
+-                        model.layers[il].ffn_down_shexp, NULL, NULL,
+-                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-                cb(ffn_shexp, "ffn_shexp", il);
++                ggml_tensor * moe_out = build_moe_ffn(cur,
++                    model.layers[il].ffn_gate_inp,
++                    model.layers[il].ffn_up_exps,
++                    model.layers[il].ffn_gate_exps,
++                    model.layers[il].ffn_down_exps,
++                    nullptr,
++                    n_expert, n_expert_act,
++                    LLM_FFN_SILU, false,
++                    false, hparams.expert_weights_scale,
++                    LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
++                    il);
++                cb(moe_out, "ffn_moe_out", il);
+ 
+                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                 cb(cur, "ffn_out", il);
++            } else {
++                // Self-speculative draft mode: shared expert only, skip routed experts
++                cur = ffn_shexp;
++                cb(cur, "ffn_out", il);
+             }
+         }
+         cur = ggml_add(ctx0, cur, ffn_inp);
+```
