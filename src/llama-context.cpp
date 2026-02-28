@@ -974,6 +974,19 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_moe_draft_mode(int32_t n_expert) {
+    LLAMA_LOG_DEBUG("%s: n_expert = %d\n", __func__, n_expert);
+
+    if (moe_draft_n_expert == n_expert) {
+        return;
+    }
+
+    moe_draft_n_expert = n_expert;
+
+    // changing expert count changes graph topology — force scheduler re-reserve
+    sched_need_reserve = true;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -2047,6 +2060,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.moe_draft_n_expert =*/ moe_draft_n_expert,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -2945,6 +2959,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
+}
+
+void llama_set_moe_draft_mode(llama_context * ctx, int32_t n_expert) {
+    ctx->set_moe_draft_mode(n_expert);
 }
 
 void llama_synchronize(llama_context * ctx) {

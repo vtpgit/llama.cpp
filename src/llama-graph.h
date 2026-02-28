@@ -553,6 +553,12 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // self-speculative decoding: override n_expert_used in MoE layers
+    //   -1 = normal mode (use hparams.n_expert_used)
+    //    0 = skip all routed experts (shared expert only)
+    //   1+ = use top-N routed experts (draft with reduced expert count)
+    int32_t moe_draft_n_expert = -1;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -615,6 +621,7 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
+            moe_draft_n_expert  == other.moe_draft_n_expert  &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -716,6 +723,9 @@ struct llm_graph_context {
     const int64_t n_embd_v_gqa;
     const int64_t n_expert;
     const int64_t n_expert_used;
+
+    // self-speculative decoding: override for n_expert_used in draft mode
+    const int32_t moe_draft_n_expert;
 
     const float freq_base;
     const float freq_scale;

@@ -207,33 +207,40 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
-            // MoE branch
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale, hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il,
-                nullptr,
-                model.layers[il].ffn_gate_up_exps);
-            cb(moe_out, "ffn_moe_out", il);
+            // FFN shared expert (always computed, even in draft mode)
+            ggml_tensor * ffn_shexp =
+                build_ffn(cur,
+                    model.layers[il].ffn_up_shexp, NULL, NULL,
+                    model.layers[il].ffn_gate_shexp, NULL, NULL,
+                    model.layers[il].ffn_down_shexp, NULL, NULL,
+                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            cb(ffn_shexp, "ffn_shexp", il);
 
-            // FFN shared expert
-            {
-                ggml_tensor * ffn_shexp =
-                    build_ffn(cur,
-                        model.layers[il].ffn_up_shexp, NULL, NULL,
-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
-                        model.layers[il].ffn_down_shexp, NULL, NULL,
-                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
-                cb(ffn_shexp, "ffn_shexp", il);
+            if (moe_draft_n_expert != 0) {
+                // MoE branch: use full experts (normal) or reduced count (draft)
+                const int64_t n_expert_act = (moe_draft_n_expert > 0)
+                    ? (int64_t) moe_draft_n_expert : n_expert_used;
+
+                ggml_tensor * moe_out = build_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_act,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale, hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps);
+                cb(moe_out, "ffn_moe_out", il);
 
                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                cb(cur, "ffn_out", il);
+            } else {
+                // Self-speculative draft mode: shared expert only, skip routed experts
+                cur = ffn_shexp;
                 cb(cur, "ffn_out", il);
             }
         }

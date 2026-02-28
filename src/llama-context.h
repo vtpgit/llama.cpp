@@ -105,6 +105,10 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // self-speculative decoding: set MoE draft expert count
+    //   -1 = normal mode, 0 = shared expert only, 1+ = top-N routed experts
+    void set_moe_draft_mode(int32_t n_expert);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -342,6 +346,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // self-speculative decoding: MoE draft expert count (-1 = normal)
+    int32_t moe_draft_n_expert = -1;
 
     // perf
     mutable int64_t t_start_us  = 0;
